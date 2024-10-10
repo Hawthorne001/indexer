@@ -22,26 +22,19 @@ Configuration options have been expanded to allow control over the subgraph fres
 
 ### Example Configuration
 
-Here is a snippet of an Arbitrum network specification file with the suggested options for Arbitrum One and Arbitrum Goerli:
+Here is a snippet of an Arbitrum network specification file with the suggested options for Arbitrum One and Arbitrum Sepolia:
 
 ```yaml
 subgraphs:
-  maxBlockDistance: 60
+  maxBlockDistance: 5000
   freshnessSleepMilliseconds: 10000
 ```
 
 ## Practical Implications
 
-Upon investigating testnets for block distances, we observed that the block distances for Arbitrum-Goerli typically fall under a 50-block threshold. Conversely, no significant distances were recorded in Goerli.
+The following default values have been established based on **Arbitrum-One** observations:
 
-The following default values have been established based on **Ethereum** observations:
-
-- **maxBlockDistance:** 0 blocks
-- **freshnessSleepMilliseconds:** 5000 (5 seconds)
-
-The recommended settings for **Arbitrum** networks are:
-
-- **maxBlockDistance:** 60 blocks
+- **maxBlockDistance:** 1000 blocks
 - **freshnessSleepMilliseconds:** 10000 (10 seconds)
 
 

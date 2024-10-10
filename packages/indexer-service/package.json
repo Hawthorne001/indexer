@@ -1,6 +1,6 @@
 {
   "name": "@graphprotocol/indexer-service",
-  "version": "0.21.2",
+  "version": "0.21.4",
   "description": "Indexer service",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -17,9 +17,9 @@
     "compile": "tsc --build",
     "prepare": "yarn format && yarn lint && yarn compile",
     "start": "node ./dist/index.js start",
-    "test": "jest --colors --verbose --detectOpenHandles",
-    "test:ci": "jest --verbose --ci",
-    "test:watch": "jest --watch --passWithNoTests --detectOpenHandles --verbose",
+    "test": "jest --colors --verbose --detectOpenHandles --runInBand",
+    "test:ci": "jest --verbose --ci --runInBand",
+    "test:watch": "jest --watch --passWithNoTests --detectOpenHandles --verbose --runInBand",
     "clean": "rm -rf ./node_modules ./dist ./tsconfig.tsbuildinfo"
   },
   "bin": {
@@ -31,15 +31,15 @@
     "graphql": "16.8.0"
   },
   "dependencies": {
-    "@google-cloud/profiler": "4.1.7",
-    "@graphprotocol/common-ts": "2.0.9",
-    "@graphprotocol/indexer-common": "^0.21.2",
-    "@graphprotocol/indexer-native": "0.20.11",
+    "@google-cloud/profiler": "6.0.1",
+    "@graphprotocol/common-ts": "2.0.10",
+    "@graphprotocol/indexer-common": "^0.21.4",
+    "@graphprotocol/indexer-native": "0.21.4",
     "@graphql-tools/load": "8.0.0",
     "@graphql-tools/url-loader": "8.0.0",
     "@graphql-tools/wrap": "10.0.1",
     "@thi.ng/cache": "1.0.94",
-    "@urql/core": "2.4.4",
+    "@urql/core": "3.1.0",
     "apollo-link-http": "1.5.17",
     "axios": "0.26.1",
     "body-parser": "1.20.2",

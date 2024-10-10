@@ -23,6 +23,7 @@ import {
   indexerError,
   IndexerErrorCode,
   GraphNode,
+  monitorEligibleAllocations,
   Network,
   NetworkSubgraph,
   registerIndexerErrorMetrics,
@@ -32,7 +33,7 @@ import {
 
 import { createServer } from '../server'
 import { QueryProcessor } from '../queries'
-import { ensureAttestationSigners, monitorEligibleAllocations } from '../allocations'
+import { ensureAttestationSigners } from '../allocations'
 import { AllocationReceiptManager } from '../query-fees'
 import pRetry from 'p-retry'
 
@@ -184,6 +185,29 @@ export default {
         type: 'string',
         required: false,
       })
+      .option('info-rate-limit', {
+        description:
+          'Max requests per minute before returning 429 status codes, applies to paths: /cost, /subgraphs/health, /operator',
+        type: 'number',
+        required: false,
+        default: 300,
+        group: 'Server options',
+      })
+      .option('status-rate-limit', {
+        description:
+          'Max requests per minute before returning 429 status codes, applies to paths: /status, /network',
+        type: 'number',
+        required: false,
+        default: 300,
+        group: 'Server options',
+      })
+      .option('body-size-limit', {
+        description: 'Max body size per request (mb)',
+        type: 'number',
+        required: false,
+        default: 0.1,
+        group: 'Server options',
+      })
 
       .check(argv => {
         if (!argv['network-subgraph-endpoint'] && !argv['network-subgraph-deployment']) {
@@ -294,7 +318,6 @@ export default {
       'http://fake-graph-node-admin-endpoint',
       argv.graphNodeQueryEndpoint,
       argv.graphNodeStatusEndpoint,
-      argv.indexNodeIds,
     )
 
     const networkProvider = await Network.provider(
@@ -459,7 +482,6 @@ export default {
     const indexerManagementClient = await createIndexerManagementClient({
       models,
       graphNode,
-      indexNodeIDs: ['node_1'], // This is just a dummy since the indexer-service doesn't manage deployments,
       logger,
       defaults: {
         // This is just a dummy, since we're never writing to the management
@@ -485,6 +507,9 @@ export default {
       networkSubgraph,
       networkSubgraphAuthToken: argv.networkSubgraphAuthToken,
       serveNetworkSubgraph: argv.serveNetworkSubgraph,
+      infoRateLimit: argv.infoRateLimit,
+      statusRateLimit: argv.statusRateLimit,
+      bodySizeLimit: argv.bodySizeLimit,
     })
   },
 }

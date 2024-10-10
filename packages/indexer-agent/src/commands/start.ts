@@ -32,7 +32,9 @@ import { injectCommonStartupOptions } from './common-options'
 import pMap from 'p-map'
 import { NetworkSpecification } from '@graphprotocol/indexer-common/dist/network-specification'
 import { BigNumber } from 'ethers'
-import { displayZodParsingError } from './error-handling'
+import { displayZodParsingError } from '@graphprotocol/indexer-common'
+import { readFileSync } from 'fs'
+import { AgentConfigs } from '../types'
 
 // eslint-disable-next-line  @typescript-eslint/no-explicit-any
 export type AgentOptions = { [key: string]: any } & Argv['argv']
@@ -42,6 +44,7 @@ const SUGGESTED_SUBGRAPH_MAX_BLOCK_DISTANCE_ON_L2 =
   50 + DEFAULT_SUBGRAPH_MAX_BLOCK_DISTANCE
 const DEFAULT_SUBGRAPH_FRESHNESS_SLEEP_MILLISECONDS = 5_000
 
+// NOTE: This is run only in single-network mode
 export const start = {
   command: 'start',
   describe: 'Start the agent',
@@ -149,6 +152,12 @@ export const start = {
         type: 'string',
         group: 'Network Subgraph',
       })
+      .option('tap-subgraph-endpoint', {
+        description: 'Endpoint to query the tap subgraph from',
+        array: false,
+        type: 'string',
+        group: 'TAP Subgraph',
+      })
       .option('allocate-on-network-subgraph', {
         description: 'Whether to allocate to the network subgraph',
         type: 'boolean',
@@ -193,13 +202,13 @@ export const start = {
       .option('rebate-claim-threshold', {
         description: `Minimum value of rebate for a single allocation (in GRT) in order for it to be included in a batch rebate claim on-chain`,
         type: 'number',
-        default: 200, // This value (the marginal gain of a claim in GRT), should always exceed the marginal cost of a claim (in ETH gas)
+        default: 1, // This value (the marginal gain of a claim in GRT), should always exceed the marginal cost of a claim (in ETH gas)
         group: 'Query Fees',
       })
       .option('rebate-claim-batch-threshold', {
         description: `Minimum total value of all rebates in an batch (in GRT) before the batch is claimed on-chain`,
         type: 'number',
-        default: 2000,
+        default: 5,
         group: 'Query Fees',
       })
       .option('rebate-claim-max-batch-size', {
@@ -211,13 +220,13 @@ export const start = {
       .option('voucher-redemption-threshold', {
         description: `Minimum value of rebate for a single allocation (in GRT) in order for it to be included in a batch rebate claim on-chain`,
         type: 'number',
-        default: 200, // This value (the marginal gain of a claim in GRT), should always exceed the marginal cost of a claim (in ETH gas)
+        default: 1, // This value (the marginal gain of a claim in GRT), should always exceed the marginal cost of a claim (in ETH gas)
         group: 'Query Fees',
       })
       .option('voucher-redemption-batch-threshold', {
         description: `Minimum total value of all rebates in an batch (in GRT) before the batch is claimed on-chain`,
         type: 'number',
-        default: 2000,
+        default: 5,
         group: 'Query Fees',
       })
       .option('voucher-redemption-max-batch-size', {
@@ -230,13 +239,23 @@ export const start = {
         description:
           'Inject the GRT to DAI/USDC conversion rate into cost model variables',
         type: 'boolean',
-        default: true,
+        default: false,
         group: 'Cost Models',
       })
       .option('address-book', {
         description: 'Graph contracts address book file path',
         type: 'string',
         required: false,
+      })
+      .option('tap-address-book', {
+        description: 'TAP contracts address book file path',
+        type: 'string',
+        required: false,
+      })
+      .option('chain-finalize-time', {
+        description: 'The time in seconds that the chain finalizes blocks',
+        type: 'number',
+        default: 3600,
       })
       .option('dai-contract', {
         description:
@@ -278,6 +297,13 @@ export const start = {
         type: 'string',
         required: false,
         default: 'auto',
+        group: 'Indexer Infrastructure',
+      })
+      .option('polling-interval', {
+        description: 'Polling interval for data collection',
+        type: 'number',
+        required: false,
+        default: 120_000,
         group: 'Indexer Infrastructure',
       })
       .option('auto-allocation-min-batch-size', {
@@ -347,6 +373,7 @@ export async function createNetworkSpecification(
     autoAllocationMinBatchSize: argv.autoAllocationMinBatchSize,
     allocateOnNetworkSubgraph: argv.allocateOnNetworkSubgraph,
     register: argv.register,
+    finalityTime: argv.chainFinalizeTime,
   }
 
   const transactionMonitoring = {
@@ -368,6 +395,9 @@ export async function createNetworkSpecification(
       // TODO: We should consider indexing the Epoch Subgraph, similar
       // to how we currently do it for the Network Subgraph.
       url: argv.epochSubgraphEndpoint,
+    },
+    tapSubgraph: {
+      url: argv.tapSubgraphEndpoint,
     },
   }
 
@@ -418,6 +448,14 @@ export async function createNetworkSpecification(
     }
   }
 
+  if (chainId !== 1 && dai.inject) {
+    throw new Error(
+      `The DAI injection feature for cost models is only supported on Ethereum Mainnet`,
+    )
+  }
+
+  const tapAddressBook = loadFile(argv.tapAddressBook)
+
   try {
     return spec.NetworkSpecification.parse({
       networkIdentifier,
@@ -427,12 +465,18 @@ export async function createNetworkSpecification(
       subgraphs,
       networkProvider,
       addressBook: argv.addressBook,
+      tapAddressBook,
       dai,
     })
   } catch (parsingError) {
     displayZodParsingError(parsingError)
     process.exit(1)
   }
+}
+
+function loadFile(path: string | undefined): unknown | undefined {
+  const obj = path ? JSON.parse(readFileSync(path).toString()) : undefined
+  return obj
 }
 
 export async function run(
@@ -478,7 +522,6 @@ export async function run(
     argv.graphNodeAdminEndpoint,
     argv.graphNodeQueryEndpoint,
     argv.graphNodeStatusEndpoint,
-    argv.indexNodeIds,
   )
 
   // --------------------------------------------------------------------------------
@@ -522,6 +565,7 @@ export async function run(
         logger,
         graphNodeAdminEndpoint: argv.graphNodeAdminEndpoint,
         networkSpecifications,
+        graphNode: graphNode,
       },
       storage: new SequelizeStorage({ sequelize }),
       logger: console,
@@ -571,7 +615,6 @@ export async function run(
   const indexerManagementClient = await createIndexerManagementClient({
     models: managementModels,
     graphNode,
-    indexNodeIDs: argv.indexNodeIds,
     logger,
     defaults: {
       globalIndexingRule: {
@@ -632,17 +675,21 @@ export async function run(
   // --------------------------------------------------------------------------------
   // * The Agent itself
   // --------------------------------------------------------------------------------
-  const agent = new Agent(
+  const agentConfigs: AgentConfigs = {
     logger,
     metrics,
     graphNode,
     operators,
-    indexerManagementClient,
+    indexerManagement: indexerManagementClient,
     networks,
-    argv.offchainSubgraphs.map((s: string) => new SubgraphDeploymentID(s)),
-    argv.enableAutoMigrationSupport,
-    argv.deploymentManagement,
-  )
+    deploymentManagement: argv.deploymentManagement,
+    autoMigrationSupport: argv.enableAutoMigrationSupport,
+    offchainSubgraphs: argv.offchainSubgraphs.map(
+      (s: string) => new SubgraphDeploymentID(s),
+    ),
+    pollingInterval: argv.pollingInterval,
+  }
+  const agent = new Agent(agentConfigs)
   await agent.start()
 }
 

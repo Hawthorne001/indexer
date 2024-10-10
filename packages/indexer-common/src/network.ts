@@ -6,7 +6,12 @@ import {
   connectContracts,
   Eventual,
   AddressBook,
+  toAddress,
 } from '@graphprotocol/common-ts'
+import {
+  connectContracts as connectTapContracts,
+  NetworkContracts as TapContracts,
+} from '@semiotic-labs/tap-contracts-bindings'
 import {
   INDEXER_ERROR_MESSAGES,
   indexerError,
@@ -19,6 +24,7 @@ import {
   NetworkMonitor,
   AllocationReceiptCollector,
   SubgraphFreshnessChecker,
+  monitorEligibleAllocations,
 } from '.'
 import { providers, Wallet } from 'ethers'
 import { strict as assert } from 'assert'
@@ -30,6 +36,9 @@ import { monitorEthBalance } from './utils'
 import { QueryFeeModels } from './query-fees'
 import { readFileSync } from 'fs'
 
+import { TAPSubgraph } from './tap-subgraph'
+import { TapCollector } from './allocations/tap-collector'
+
 export class Network {
   logger: Logger
   networkSubgraph: NetworkSubgraph
@@ -39,6 +48,7 @@ export class Network {
   transactionManager: TransactionManager
   networkMonitor: NetworkMonitor
   receiptCollector: AllocationReceiptCollector
+  tapCollector: TapCollector | undefined
   specification: spec.NetworkSpecification
   paused: Eventual<boolean>
   isOperator: Eventual<boolean>
@@ -52,6 +62,7 @@ export class Network {
     transactionManager: TransactionManager,
     networkMonitor: NetworkMonitor,
     receiptCollector: AllocationReceiptCollector,
+    tapCollector: TapCollector | undefined,
     specification: spec.NetworkSpecification,
     paused: Eventual<boolean>,
     isOperator: Eventual<boolean>,
@@ -64,6 +75,7 @@ export class Network {
     this.transactionManager = transactionManager
     this.networkMonitor = networkMonitor
     this.receiptCollector = receiptCollector
+    this.tapCollector = tapCollector
     this.specification = specification
     this.paused = paused
     this.isOperator = isOperator
@@ -122,6 +134,23 @@ export class Network {
           : undefined,
       subgraphFreshnessChecker: networkSubgraphFreshnessChecker,
     })
+    const tapSubgraphFreshnessChecker = new SubgraphFreshnessChecker(
+      'TAP Subgraph',
+      networkProvider,
+      specification.subgraphs.maxBlockDistance,
+      specification.subgraphs.freshnessSleepMilliseconds,
+      logger.child({ component: 'FreshnessChecker' }),
+      Infinity,
+    )
+
+    let tapSubgraph: TAPSubgraph | undefined = undefined
+    if (specification.subgraphs.tapSubgraph && specification.subgraphs.tapSubgraph.url) {
+      tapSubgraph = new TAPSubgraph(
+        specification.subgraphs.tapSubgraph!.url!,
+        tapSubgraphFreshnessChecker,
+        logger.child({ component: 'TAPSubgraph' }),
+      )
+    }
 
     // * -----------------------------------------------------------------------
     // * Contracts
@@ -213,16 +242,68 @@ export class Network {
     )
 
     // --------------------------------------------------------------------------------
+    // * Escrow contract
+    // --------------------------------------------------------------------------------
+    const networkIdentifier = await networkProvider.getNetwork()
+    let tapContracts: TapContracts | undefined = undefined
+    if (tapSubgraph) {
+      try {
+        tapContracts = await connectTapContracts(
+          wallet,
+          networkIdentifier.chainId,
+          specification.tapAddressBook,
+        )
+      } catch (err) {
+        logger.error(`Failed to connect to tap contract bindings:`, { err })
+        throw err
+      }
+    }
+    // --------------------------------------------------------------------------------
+    // * Allocation and allocation signers
+    // --------------------------------------------------------------------------------
+    const allocations = monitorEligibleAllocations({
+      indexer: toAddress(specification.indexerOptions.address),
+      logger,
+      networkSubgraph,
+      protocolNetwork: resolveChainId(networkIdentifier.chainId),
+      interval: specification.allocationSyncInterval,
+    })
+
+    // --------------------------------------------------------------------------------
     // * Allocation Receipt Collector
     // --------------------------------------------------------------------------------
-    const receiptCollector = await AllocationReceiptCollector.create({
+    const scalarCollector = await AllocationReceiptCollector.create({
       logger,
       metrics,
       transactionManager: transactionManager,
       models: queryFeeModels,
       allocationExchange: contracts.allocationExchange,
+      allocations,
       networkSpecification: specification,
+      networkSubgraph,
     })
+
+    // --------------------------------------------------------------------------------
+    // * TAP Collector
+    // --------------------------------------------------------------------------------
+    let tapCollector: TapCollector | undefined = undefined
+    if (tapContracts && tapSubgraph) {
+      tapCollector = TapCollector.create({
+        logger,
+        metrics,
+        transactionManager: transactionManager,
+        models: queryFeeModels,
+        tapContracts,
+        allocations,
+        networkSpecification: specification,
+        tapSubgraph,
+        networkSubgraph,
+      })
+    } else {
+      logger.info(`RAV process not initiated. 
+        Tap Contracts: ${!!tapContracts}. 
+        Tap Subgraph: ${!!tapSubgraph}.`)
+    }
 
     // --------------------------------------------------------------------------------
     // * Network
@@ -235,7 +316,8 @@ export class Network {
       networkProvider,
       transactionManager,
       networkMonitor,
-      receiptCollector,
+      scalarCollector,
+      tapCollector,
       specification,
       paused,
       isOperator,

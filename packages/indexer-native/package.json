@@ -1,6 +1,6 @@
 {
   "name": "@graphprotocol/indexer-native",
-  "version": "0.20.11",
+  "version": "0.21.4",
   "description": "Performance sensitive indexer code",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",
@@ -41,12 +41,12 @@
     "lint": "eslint .",
     "prepare": "yarn format && yarn lint",
     "install": "yarn pull-or-build",
-    "test": "jest --colors --verbose --forceExit",
-    "test:ci": "jest --verbose --ci",
+    "test": "yarn build && jest --colors --verbose --forceExit",
+    "test:ci": "yarn build && jest --verbose --ci",
     "clean": "rm -rf ./node_modules ./binary ./build ./coverage ./native/target ./native/artifacts.json ./native/index.node"
   },
   "dependencies": {
-    "@graphprotocol/common-ts": "2.0.9",
+    "@graphprotocol/common-ts": "2.0.10",
     "@mapbox/node-pre-gyp": "1.0.11",
     "cargo-cp-artifact": "0.1.8",
     "node-pre-gyp-github": "1.4.4"

@@ -1,8 +1,4 @@
-import {
-  NetworkMonitor,
-  epochElapsedBlocks,
-  Network,
-} from '@graphprotocol/indexer-common'
+import { epochElapsedBlocks, Network } from '@graphprotocol/indexer-common'
 /* eslint-disable @typescript-eslint/explicit-module-boundary-types */
 /* eslint-disable @typescript-eslint/ban-types */
 
@@ -19,7 +15,6 @@ import {
   toAddress,
 } from '@graphprotocol/common-ts'
 import {
-  Allocation,
   allocationIdProof,
   AllocationStatus,
   CloseAllocationResult,
@@ -29,7 +24,6 @@ import {
   IndexerManagementResolverContext,
   IndexingDecisionBasis,
   IndexingRuleAttributes,
-  GraphNode,
   NetworkSubgraph,
   ReallocateAllocationResult,
   SubgraphIdentifierType,
@@ -262,76 +256,6 @@ async function queryAllocations(
       }
     },
   )
-}
-
-async function resolvePOI(
-  networkMonitor: NetworkMonitor,
-  graphNode: GraphNode,
-  allocation: Allocation,
-  poi: string | undefined,
-  force: boolean,
-): Promise<string> {
-  // poi = undefined, force=true  -- submit even if poi is 0x0
-  // poi = defined,   force=true  -- no generatedPOI needed, just submit the POI supplied (with some sanitation?)
-  // poi = undefined, force=false -- submit with generated POI if one available
-  // poi = defined,   force=false -- submit user defined POI only if generated POI matches
-  switch (force) {
-    case true:
-      switch (!!poi) {
-        case true:
-          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-          return poi!
-        case false:
-          return (
-            (await graphNode.proofOfIndexing(
-              allocation.subgraphDeployment.id,
-              await networkMonitor.fetchPOIBlockPointer(allocation),
-              allocation.indexer,
-            )) || utils.hexlify(Array(32).fill(0))
-          )
-      }
-      break
-    case false: {
-      const currentEpochStartBlock = await networkMonitor.fetchPOIBlockPointer(allocation)
-      const generatedPOI = await graphNode.proofOfIndexing(
-        allocation.subgraphDeployment.id,
-        currentEpochStartBlock,
-        allocation.indexer,
-      )
-      switch (poi == generatedPOI) {
-        case true:
-          if (poi == undefined) {
-            const deploymentStatus = await graphNode.indexingStatus([
-              allocation.subgraphDeployment.id,
-            ])
-            throw indexerError(
-              IndexerErrorCode.IE067,
-              `POI not available for deployment at current epoch start block.
-              currentEpochStartBlock: ${currentEpochStartBlock.number}
-              deploymentStatus: ${
-                deploymentStatus.length > 0
-                  ? JSON.stringify(deploymentStatus)
-                  : 'not deployed'
-              }`,
-            )
-          } else {
-            return poi
-          }
-        case false:
-          if (poi == undefined && generatedPOI !== undefined) {
-            return generatedPOI
-          } else if (poi !== undefined && generatedPOI == undefined) {
-            return poi
-          }
-          throw indexerError(
-            IndexerErrorCode.IE068,
-            `User provided POI does not match reference fetched from the graph-node. Use '--force' to bypass this POI accuracy check.
-            POI: ${poi},
-            referencePOI: ${generatedPOI}`,
-          )
-      }
-    }
-  }
 }
 
 export default {
@@ -650,7 +574,7 @@ export default {
       force: boolean
       protocolNetwork: string
     },
-    { graphNode, logger, models, multiNetworks }: IndexerManagementResolverContext,
+    { logger, models, multiNetworks }: IndexerManagementResolverContext,
   ): Promise<CloseAllocationResult> => {
     logger.debug('Execute closeAllocation() mutation', {
       allocationID: allocation,
@@ -670,20 +594,7 @@ export default {
     const allocationData = await networkMonitor.allocation(allocation)
 
     try {
-      // Ensure allocation is old enough to close
-      const currentEpoch = await contracts.epochManager.currentEpoch()
-      if (BigNumber.from(allocationData.createdAtEpoch).eq(currentEpoch)) {
-        throw indexerError(
-          IndexerErrorCode.IE064,
-          `Allocation '${
-            allocationData.id
-          }' cannot be closed until epoch ${currentEpoch.add(
-            1,
-          )}. (Allocations cannot be closed in the same epoch they were created)`,
-        )
-      }
-
-      poi = await resolvePOI(networkMonitor, graphNode, allocationData, poi, force)
+      poi = await networkMonitor.resolvePOI(allocationData, poi, force)
 
       // Double-check whether the allocation is still active on chain, to
       // avoid unnecessary transactions.
@@ -820,7 +731,7 @@ export default {
       force: boolean
       protocolNetwork: string
     },
-    { graphNode, logger, models, multiNetworks }: IndexerManagementResolverContext,
+    { logger, models, multiNetworks }: IndexerManagementResolverContext,
   ): Promise<ReallocateAllocationResult> => {
     logger = logger.child({
       component: 'reallocateAllocationResolver',
@@ -864,27 +775,10 @@ export default {
     }
 
     try {
-      // Ensure allocation is old enough to close
       const currentEpoch = await contracts.epochManager.currentEpoch()
-      if (BigNumber.from(allocationData.createdAtEpoch).eq(currentEpoch)) {
-        throw indexerError(
-          IndexerErrorCode.IE064,
-          `Allocation '${
-            allocationData.id
-          }' cannot be closed until epoch ${currentEpoch.add(
-            1,
-          )}. (Allocations cannot be closed in the same epoch they were created)`,
-        )
-      }
 
       logger.debug('Resolving POI')
-      const allocationPOI = await resolvePOI(
-        networkMonitor,
-        graphNode,
-        allocationData,
-        poi,
-        force,
-      )
+      const allocationPOI = await networkMonitor.resolvePOI(allocationData, poi, force)
       logger.debug('POI resolved', {
         userProvidedPOI: poi,
         poi: allocationPOI,
@@ -1124,6 +1018,50 @@ export default {
         createdAllocationStake: formatGRT(createAllocationEventLogs.tokens),
         protocolNetwork,
       }
+    } catch (error) {
+      logger.error(error.toString())
+      throw error
+    }
+  },
+
+  submitCollectReceiptsJob: async (
+    {
+      allocation,
+      protocolNetwork,
+    }: {
+      allocation: string
+      protocolNetwork: string
+    },
+    { logger, multiNetworks }: IndexerManagementResolverContext,
+  ): Promise<boolean> => {
+    logger.debug('Execute collectAllocationReceipts() mutation', {
+      allocationID: allocation,
+      protocolNetwork,
+    })
+    if (!multiNetworks) {
+      throw Error(
+        'IndexerManagementClient must be in `network` mode to collect receipts for an allocation',
+      )
+    }
+    const network = extractNetwork(protocolNetwork, multiNetworks)
+    const networkMonitor = network.networkMonitor
+    const receiptCollector = network.receiptCollector
+
+    const allocationData = await networkMonitor.allocation(allocation)
+
+    try {
+      logger.info('Identifying receipts worth collecting', {
+        allocation: allocation,
+      })
+
+      // Collect query fees for this allocation
+      const collecting = await receiptCollector.collectReceipts(0, allocationData)
+
+      logger.info(`Submitted allocation receipt collection job for execution`, {
+        allocationID: allocation,
+        protocolNetwork: network.specification.networkIdentifier,
+      })
+      return collecting
     } catch (error) {
       logger.error(error.toString())
       throw error

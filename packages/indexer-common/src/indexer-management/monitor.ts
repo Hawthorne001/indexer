@@ -59,6 +59,36 @@ export class NetworkMonitor {
     return await this.contracts.staking.maxAllocationEpochs()
   }
 
+  /**
+   * Check if the network of the allocation is supported
+   *
+   * (todo-future: check if present in the epoch subgraph)
+   * @param allocation: Allocation to check
+   * @returns network `alias` if the network is supported, `null` otherwise
+   */
+  async allocationNetworkAlias(allocation: Allocation): Promise<string | null> {
+    // TODO:
+    // resolveChainId will throw an Error when we can't resolve the chainId in
+    // the future, let's get this from the epoch subgraph (perhaps at startup)
+    // and then resolve it here.
+    try {
+      const { network: allocationNetworkAlias } = await this.graphNode.subgraphFeatures(
+        allocation.subgraphDeployment.id,
+      )
+      if (null === allocationNetworkAlias) {
+        return null
+      }
+
+      // TODO: check if the network is present in the epoch subgraph instead of
+      // our hardcoded list
+      resolveChainId(allocationNetworkAlias)
+
+      return allocationNetworkAlias
+    } catch {
+      return null
+    }
+  }
+
   async allocation(allocationID: string): Promise<Allocation> {
     const result = await this.networkSubgraph.checkedQuery(
       gql`
@@ -336,7 +366,7 @@ export class NetworkMonitor {
     }
     let subgraphs: Subgraph[] = []
     const queryProgress = {
-      lastCreatedAt: 0,
+      lastId: '',
       first: 20,
       fetched: 0,
       exhausted: false,
@@ -352,10 +382,10 @@ export class NetworkMonitor {
       try {
         const result = await this.networkSubgraph.checkedQuery(
           gql`
-            query subgraphs($first: Int!, $lastCreatedAt: Int!, $subgraphs: [String!]!) {
+            query subgraphs($first: Int!, $lastId: String!, $subgraphs: [String!]!) {
               subgraphs(
-                where: { id_gt: $lastCreatedAt, id_in: $subgraphs }
-                orderBy: createdAt
+                where: { id_gt: $lastId, id_in: $subgraphs }
+                orderBy: id
                 orderDirection: asc
                 first: $first
               ) {
@@ -374,7 +404,7 @@ export class NetworkMonitor {
           `,
           {
             first: queryProgress.first,
-            lastCreatedAt: queryProgress.lastCreatedAt,
+            lastId: queryProgress.lastId,
             subgraphs: ids,
           },
         )
@@ -410,7 +440,7 @@ export class NetworkMonitor {
 
         queryProgress.exhausted = results.length < queryProgress.first
         queryProgress.fetched += results.length
-        queryProgress.lastCreatedAt = results[results.length - 1].createdAt
+        queryProgress.lastId = results[results.length - 1].id
 
         subgraphs = subgraphs.concat(results)
       } catch (error) {
@@ -474,7 +504,6 @@ export class NetworkMonitor {
         return undefined
       }
 
-      // TODO: Make and use parseGraphqlDeployment() function
       return parseGraphQLSubgraphDeployment(
         result.data.subgraphDeployments[0],
         this.networkCAIPID,
@@ -581,7 +610,7 @@ export class NetworkMonitor {
   async subgraphDeployments(): Promise<SubgraphDeployment[]> {
     const deployments: SubgraphDeployment[] = []
     const queryProgress = {
-      lastCreatedAt: 0,
+      lastId: '',
       first: 10,
       fetched: 0,
       exhausted: false,
@@ -596,10 +625,10 @@ export class NetworkMonitor {
       try {
         const result = await this.networkSubgraph.checkedQuery(
           gql`
-            query subgraphDeployments($first: Int!, $lastCreatedAt: Int!) {
+            query subgraphDeployments($first: Int!, $lastId: String!) {
               subgraphDeployments(
-                where: { createdAt_gt: $lastCreatedAt }
-                orderBy: createdAt
+                where: { id_gt: $lastId }
+                orderBy: id
                 orderDirection: asc
                 first: $first
               ) {
@@ -613,7 +642,7 @@ export class NetworkMonitor {
               }
             }
           `,
-          { first: queryProgress.first, lastCreatedAt: queryProgress.lastCreatedAt },
+          { first: queryProgress.first, lastId: queryProgress.lastId },
         )
 
         if (result.error) {
@@ -632,8 +661,7 @@ export class NetworkMonitor {
 
         queryProgress.exhausted = networkDeployments.length < queryProgress.first
         queryProgress.fetched += networkDeployments.length
-        queryProgress.lastCreatedAt =
-          networkDeployments[networkDeployments.length - 1].createdAt
+        queryProgress.lastId = networkDeployments[networkDeployments.length - 1].id
         deployments.push(
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           ...networkDeployments.map((x: any) =>
@@ -813,25 +841,11 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
     }
   }
 
-  async fetchPOIBlockPointer(allocation: Allocation): Promise<BlockPointer> {
+  async fetchPOIBlockPointer(
+    deploymentNetworkAlias: string,
+    allocation: Allocation,
+  ): Promise<BlockPointer> {
     try {
-      const deploymentIndexingStatuses = await this.graphNode.indexingStatus([
-        allocation.subgraphDeployment.id,
-      ])
-      if (
-        deploymentIndexingStatuses.length != 1 ||
-        deploymentIndexingStatuses[0].chains.length != 1 ||
-        !deploymentIndexingStatuses[0].chains[0].network
-      ) {
-        this.logger.error(
-          `No indexing status data found for ${allocation.subgraphDeployment.id.ipfsHash}`,
-        )
-        throw indexerError(
-          IndexerErrorCode.IE018,
-          `No indexing status data found for ${allocation.subgraphDeployment.id.ipfsHash}`,
-        )
-      }
-      const deploymentNetworkAlias = deploymentIndexingStatuses[0].chains[0].network
       const deploymentNetworkCAIPID = resolveChainId(deploymentNetworkAlias)
       const currentEpoch = await this.currentEpoch(deploymentNetworkCAIPID)
 
@@ -860,6 +874,13 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
     poi: string | undefined,
     force: boolean,
   ): Promise<string> {
+    // If the network is not supported, we can't resolve POI, as there will be no active epoch
+    const supportedNetworkAlias = await this.allocationNetworkAlias(allocation)
+    if (null === supportedNetworkAlias) {
+      this.logger.info("Network is not supported, can't resolve POI")
+      return utils.hexlify(Array(32).fill(0))
+    }
+
     // poi = undefined, force=true  -- submit even if poi is 0x0
     // poi = defined,   force=true  -- no generatedPOI needed, just submit the POI supplied (with some sanitation?)
     // poi = undefined, force=false -- submit with generated POI if one available
@@ -874,14 +895,17 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
             return (
               (await this.graphNode.proofOfIndexing(
                 allocation.subgraphDeployment.id,
-                await this.fetchPOIBlockPointer(allocation),
+                await this.fetchPOIBlockPointer(supportedNetworkAlias, allocation),
                 allocation.indexer,
               )) || utils.hexlify(Array(32).fill(0))
             )
         }
         break
       case false: {
-        const epochStartBlock = await this.fetchPOIBlockPointer(allocation)
+        const epochStartBlock = await this.fetchPOIBlockPointer(
+          supportedNetworkAlias,
+          allocation,
+        )
         // Obtain the start block of the current epoch
         const generatedPOI = await this.graphNode.proofOfIndexing(
           allocation.subgraphDeployment.id,
@@ -1128,7 +1152,7 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
     try {
       const zeroPOI = utils.hexlify(Array(32).fill(0))
       const disputableEpoch = currentEpoch - this.indexerOptions.poiDisputableEpochs
-      let lastCreatedAt = 0
+      let lastId = ''
       while (dataRemaining) {
         const result = await this.networkSubgraph.checkedQuery(
           gql`
@@ -1137,11 +1161,11 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
               $minimumAllocation: Int!
               $disputableEpoch: Int!
               $zeroPOI: String!
-              $createdAt: Int!
+              $lastId: String!
             ) {
               allocations(
                 where: {
-                  createdAt_gt: $createdAt
+                  id_gt: $lastId
                   subgraphDeployment_in: $deployments
                   allocatedTokens_gt: $minimumAllocation
                   closedAtEpoch_gte: $disputableEpoch
@@ -1149,7 +1173,7 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
                   poi_not: $zeroPOI
                 }
                 first: 1000
-                orderBy: createdAt
+                orderBy: id
                 orderDirection: asc
               ) {
                 id
@@ -1175,7 +1199,7 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
             deployments: deployments.map((subgraph) => subgraph.bytes32),
             minimumAllocation,
             disputableEpoch,
-            createdAt: lastCreatedAt,
+            lastId,
             zeroPOI,
           },
         )
@@ -1186,7 +1210,7 @@ Please submit an issue at https://github.com/graphprotocol/block-oracle/issues/n
         if (result.data.allocations.length == 0) {
           dataRemaining = false
         } else {
-          lastCreatedAt = result.data.allocations.slice(-1)[0].createdAt
+          lastId = result.data.allocations.slice(-1)[0].id
           const parsedResult: Allocation[] =
             result.data.allocations.map(parseGraphQLAllocation)
           allocations = allocations.concat(parsedResult)

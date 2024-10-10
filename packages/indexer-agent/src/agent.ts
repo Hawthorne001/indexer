@@ -36,6 +36,7 @@ import {
   networkIsL2,
   networkIsL1,
   DeploymentManagementMode,
+  SubgraphStatus,
 } from '@graphprotocol/indexer-common'
 
 import PQueue from 'p-queue'
@@ -43,6 +44,7 @@ import pMap from 'p-map'
 import pFilter from 'p-filter'
 import mapValues from 'lodash.mapvalues'
 import zip from 'lodash.zip'
+import { AgentConfigs, NetworkAndOperator } from './types'
 
 type ActionReconciliationContext = [AllocationDecision[], number, number]
 
@@ -125,13 +127,6 @@ export const convertSubgraphBasedRulesToDeploymentBased = (
   return rules
 }
 
-// Represents a pair of Network and Operator instances belonging to the same protocol
-// network. Used when mapping over multiple protocol networks.
-type NetworkAndOperator = {
-  network: Network
-  operator: Operator
-}
-
 // Extracts the network identifier from a pair of matching Network and Operator objects.
 function networkAndOperatorIdentity({
   network,
@@ -195,26 +190,21 @@ export class Agent {
   offchainSubgraphs: SubgraphDeploymentID[]
   autoMigrationSupport: boolean
   deploymentManagement: DeploymentManagementMode
+  pollingInterval: number
 
-  constructor(
-    logger: Logger,
-    metrics: Metrics,
-    graphNode: GraphNode,
-    operators: Operator[],
-    indexerManagement: IndexerManagementClient,
-    networks: Network[],
-    offchainSubgraphs: SubgraphDeploymentID[],
-    autoMigrationSupport: boolean,
-    deploymentManagement: DeploymentManagementMode,
-  ) {
-    this.logger = logger.child({ component: 'Agent' })
-    this.metrics = metrics
-    this.graphNode = graphNode
-    this.indexerManagement = indexerManagement
-    this.multiNetworks = createMultiNetworks(networks, operators)
-    this.offchainSubgraphs = offchainSubgraphs
-    this.autoMigrationSupport = !!autoMigrationSupport
-    this.deploymentManagement = deploymentManagement
+  constructor(configs: AgentConfigs) {
+    this.logger = configs.logger.child({ component: 'Agent' })
+    this.metrics = configs.metrics
+    this.graphNode = configs.graphNode
+    this.indexerManagement = configs.indexerManagement
+    this.multiNetworks = createMultiNetworks(
+      configs.networks,
+      configs.operators,
+    )
+    this.offchainSubgraphs = configs.offchainSubgraphs
+    this.autoMigrationSupport = !!configs.autoMigrationSupport
+    this.deploymentManagement = configs.deploymentManagement
+    this.pollingInterval = configs.pollingInterval
   }
 
   async start(): Promise<Agent> {
@@ -260,9 +250,11 @@ export class Agent {
   }
 
   reconciliationLoop() {
+    const requestIntervalSmall = this.pollingInterval
+    const requestIntervalLarge = this.pollingInterval * 5
     const logger = this.logger.child({ component: 'ReconciliationLoop' })
     const currentEpochNumber: Eventual<NetworkMapped<number>> = timer(
-      600_000,
+      requestIntervalLarge,
     ).tryMap(
       async () =>
         await this.multiNetworks.map(({ network }) => {
@@ -278,7 +270,7 @@ export class Agent {
     )
 
     const maxAllocationEpochs: Eventual<NetworkMapped<number>> = timer(
-      600_000,
+      requestIntervalLarge,
     ).tryMap(
       () =>
         this.multiNetworks.map(({ network }) => {
@@ -294,7 +286,7 @@ export class Agent {
     )
 
     const indexingRules: Eventual<NetworkMapped<IndexingRuleAttributes[]>> =
-      timer(20_000).tryMap(
+      timer(requestIntervalSmall).tryMap(
         async () => {
           return this.multiNetworks.map(async ({ network, operator }) => {
             logger.trace('Fetching indexing rules', {
@@ -331,7 +323,7 @@ export class Agent {
       )
 
     const activeDeployments: Eventual<SubgraphDeploymentID[]> = timer(
-      60_000,
+      requestIntervalSmall,
     ).tryMap(
       () => {
         logger.trace('Fetching active deployments')
@@ -347,7 +339,7 @@ export class Agent {
     )
 
     const networkDeployments: Eventual<NetworkMapped<SubgraphDeployment[]>> =
-      timer(240_000).tryMap(
+      timer(requestIntervalSmall).tryMap(
         async () =>
           await this.multiNetworks.map(({ network }) => {
             logger.trace('Fetching network deployments', {
@@ -366,7 +358,7 @@ export class Agent {
 
     const eligibleTransferDeployments: Eventual<
       NetworkMapped<TransferredSubgraphDeployment[]>
-    > = timer(300_000).tryMap(
+    > = timer(requestIntervalLarge).tryMap(
       async () => {
         // Return early if the auto migration feature is disabled.
         if (!this.autoMigrationSupport) {
@@ -534,7 +526,6 @@ export class Agent {
     // let targetDeployments be an union of targetAllocations
     // and offchain subgraphs.
     const targetDeployments: Eventual<SubgraphDeploymentID[]> = join({
-      ticker: timer(120_000),
       indexingRules,
       networkDeploymentAllocationDecisions,
     }).tryMap(
@@ -568,7 +559,7 @@ export class Agent {
     )
 
     const activeAllocations: Eventual<NetworkMapped<Allocation[]>> = timer(
-      120_000,
+      requestIntervalSmall,
     ).tryMap(
       () =>
         this.multiNetworks.map(({ network }) => {
@@ -645,7 +636,7 @@ export class Agent {
     )
 
     join({
-      ticker: timer(240_000),
+      ticker: timer(requestIntervalLarge),
       currentEpochNumber,
       maxAllocationEpochs,
       activeDeployments,
@@ -939,17 +930,17 @@ export class Agent {
       eligibleAllocations.map(allocation => allocation.subgraphDeployment.id),
     )
 
-    // Identify which subgraphs to deploy and which to remove
+    // Identify which subgraphs to deploy and which to pause
     const deploy = targetDeployments.filter(
       deployment => !deploymentInList(activeDeployments, deployment),
     )
-    const remove = activeDeployments.filter(
+    const pause = activeDeployments.filter(
       deployment =>
         !deploymentInList(targetDeployments, deployment) &&
         !deploymentInList(eligibleAllocationDeployments, deployment),
     )
 
-    if (deploy.length + remove.length !== 0) {
+    if (deploy.length + pause.length !== 0) {
       logger.info('Deployment changes', {
         indexingNetworkSubgraph,
         syncing: activeDeployments.map(id => id.display),
@@ -958,19 +949,20 @@ export class Agent {
           id => id.display,
         ),
         deploy: deploy.map(id => id.display),
-        remove: remove.map(id => id.display),
+        pause: pause.map(id => id.display),
       })
     } else {
       logger.debug('No deployment changes are necessary')
     }
-
     // ----------------------------------------------------------------------------------------
-    // Execute Deployments (Add, Remove)
+    // Execute Deployments (Add, Pause)
     // ----------------------------------------------------------------------------------------
 
     // Deploy/remove up to 10 subgraphs in parallel
     const queue = new PQueue({ concurrency: 10 })
 
+    const currentAssignments =
+      await this.graphNode.subgraphDeploymentsAssignments(SubgraphStatus.ALL)
     // Index all new deployments worth indexing
     await queue.addAll(
       deploy.map(deployment => async () => {
@@ -982,15 +974,13 @@ export class Agent {
         })
 
         // Ensure the deployment is deployed to the indexer
-        // Note: we're not waiting here, as sometimes indexing a subgraph
-        // will block if the IPFS files cannot be retrieved
-        await this.graphNode.ensure(name, deployment)
+        await this.graphNode.ensure(name, deployment, currentAssignments)
       }),
     )
 
     // Stop indexing deployments that are no longer worth indexing
     await queue.addAll(
-      remove.map(deployment => async () => this.graphNode.remove(deployment)),
+      pause.map(deployment => async () => this.graphNode.pause(deployment)),
     )
 
     await queue.onIdle()
@@ -1070,7 +1060,6 @@ export class Agent {
           logger,
           deploymentAllocationDecision,
           activeDeploymentAllocations,
-          epoch,
         )
       case true: {
         // If no active allocations and subgraph health passes safety check, create one
@@ -1079,8 +1068,8 @@ export class Agent {
         ])
         const indexingStatus = indexingStatuses.find(
           status =>
-            status.subgraphDeployment ==
-            deploymentAllocationDecision.deployment,
+            status.subgraphDeployment.ipfsHash ==
+            deploymentAllocationDecision.deployment.ipfsHash,
         )
         const failsHealthCheck =
           (indexingStatus &&
@@ -1115,7 +1104,6 @@ export class Agent {
               logger,
               deploymentAllocationDecision,
               activeDeploymentAllocations,
-              epoch,
             )
           } else {
             // Refresh any expiring allocations

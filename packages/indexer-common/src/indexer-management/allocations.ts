@@ -29,6 +29,7 @@ import {
   Network,
   ReallocateAllocationResult,
   SubgraphIdentifierType,
+  SubgraphStatus,
   uniqueAllocationID,
   upsertIndexingRule,
 } from '@graphprotocol/indexer-common'
@@ -46,6 +47,7 @@ import pMap from 'p-map'
 
 export interface TransactionPreparationContext {
   activeAllocations: Allocation[]
+  recentlyClosedAllocations: Allocation[]
   currentEpoch: BigNumber
   indexingStatuses: IndexingStatus[]
 }
@@ -123,6 +125,8 @@ export class AllocationManager {
 
     const validatedActions = await this.validateActionBatchFeasibilty(actions)
     logger.trace('Validated actions', { validatedActions })
+
+    await this.deployBeforeAllocating(logger, validatedActions)
 
     const populateTransactionsResults = await this.prepareTransactions(validatedActions)
 
@@ -236,11 +240,17 @@ export class AllocationManager {
   }
 
   async prepareTransactions(actions: Action[]): Promise<PopulateTransactionResult[]> {
+    const currentEpoch = await this.network.contracts.epochManager.currentEpoch()
     const context: TransactionPreparationContext = {
       activeAllocations: await this.network.networkMonitor.allocations(
         AllocationStatus.ACTIVE,
       ),
-      currentEpoch: await this.network.contracts.epochManager.currentEpoch(),
+      recentlyClosedAllocations:
+        await this.network.networkMonitor.recentlyClosedAllocations(
+          currentEpoch.toNumber(),
+          2,
+        ),
+      currentEpoch,
       indexingStatuses: await this.graphNode.indexingStatus([]),
     }
     return await pMap(
@@ -307,6 +317,28 @@ export class AllocationManager {
     }
   }
 
+  async deployBeforeAllocating(logger: Logger, actions: Action[]): Promise<void> {
+    const allocateActions = actions.filter((action) => action.type == ActionType.ALLOCATE)
+    logger.info('Ensure subgraph deployments are deployed before we allocate to them', {
+      allocateActions,
+    })
+    const currentAssignments = await this.graphNode.subgraphDeploymentsAssignments(
+      SubgraphStatus.ALL,
+    )
+    await pMap(
+      allocateActions,
+      async (action: Action) =>
+        await this.graphNode.ensure(
+          `indexer-agent/${action.deploymentID!.slice(-10)}`,
+          new SubgraphDeploymentID(action.deploymentID!),
+          currentAssignments,
+        ),
+      {
+        stopOnError: false,
+      },
+    )
+  }
+
   async prepareAllocateParams(
     logger: Logger,
     context: TransactionPreparationContext,
@@ -346,23 +378,26 @@ export class AllocationManager {
     // Check that the subgraph is syncing and healthy before allocating
     // Throw error if:
     //    - subgraph deployment is not syncing,
-    //    - subgraph deployment is failed
     const status = context.indexingStatuses.find(
       (status) => status.subgraphDeployment.ipfsHash == deployment.ipfsHash,
     )
     if (!status) {
       throw indexerError(
-        IndexerErrorCode.IE020,
+        IndexerErrorCode.IE077,
         `Subgraph deployment, '${deployment.ipfsHash}', is not syncing`,
       )
     }
 
     logger.debug('Obtain a unique Allocation ID')
+    const activeAndRecentlyClosedAllocations: Allocation[] = [
+      ...context.recentlyClosedAllocations,
+      ...context.activeAllocations,
+    ]
     const { allocationSigner, allocationId } = uniqueAllocationID(
       this.network.transactionManager.wallet.mnemonic.phrase,
       context.currentEpoch.toNumber(),
       deployment,
-      context.activeAllocations.map((allocation) => allocation.id),
+      activeAndRecentlyClosedAllocations.map((allocation) => allocation.id),
     )
 
     // Double-check whether the allocationID already exists on chain, to
@@ -519,18 +554,6 @@ export class AllocationManager {
     })
     const allocation = await this.network.networkMonitor.allocation(allocationID)
 
-    // Ensure allocation is old enough to close
-    if (BigNumber.from(allocation.createdAtEpoch).eq(context.currentEpoch)) {
-      throw indexerError(
-        IndexerErrorCode.IE064,
-        `Allocation '${
-          allocation.id
-        }' cannot be closed until epoch ${context.currentEpoch.add(
-          1,
-        )}. (Allocations cannot be closed in the same epoch they were created)`,
-      )
-    }
-
     poi = await this.network.networkMonitor.resolvePOI(allocation, poi, force)
 
     // Double-check whether the allocation is still active on chain, to
@@ -626,14 +649,14 @@ export class AllocationManager {
     logger.debug(
       `Updating indexing rules so indexer-agent keeps the deployment synced but doesn't reallocate to it`,
     )
-    const offchainIndexingRule = {
+    const neverIndexingRule = {
       identifier: allocation.subgraphDeployment.id.ipfsHash,
       protocolNetwork: this.network.specification.networkIdentifier,
       identifierType: SubgraphIdentifierType.DEPLOYMENT,
-      decisionBasis: IndexingDecisionBasis.OFFCHAIN,
+      decisionBasis: IndexingDecisionBasis.NEVER,
     } as Partial<IndexingRuleAttributes>
 
-    await upsertIndexingRule(logger, this.models, offchainIndexingRule)
+    await upsertIndexingRule(logger, this.models, neverIndexingRule)
 
     return {
       actionID,
@@ -703,16 +726,6 @@ export class AllocationManager {
       throw indexerError(
         IndexerErrorCode.IE063,
         `Reallocation failed: No active allocation with id '${allocationID}' found`,
-      )
-    }
-    if (BigNumber.from(allocation.createdAtEpoch).eq(context.currentEpoch)) {
-      throw indexerError(
-        IndexerErrorCode.IE064,
-        `Allocation '${
-          allocation.id
-        }' cannot be closed until epoch ${context.currentEpoch.add(
-          1,
-        )}. (Allocations cannot be closed in the same epoch they were created)`,
       )
     }
 

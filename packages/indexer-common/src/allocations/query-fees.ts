@@ -8,6 +8,7 @@ import {
   formatGRT,
   Address,
   Metrics,
+  Eventual,
 } from '@graphprotocol/common-ts'
 import {
   Allocation,
@@ -24,6 +25,7 @@ import { DHeap } from '@thi.ng/heaps'
 import { BigNumber, BigNumberish, Contract } from 'ethers'
 import { Op } from 'sequelize'
 import pReduce from 'p-reduce'
+import { NetworkSubgraph } from '../network-subgraph'
 
 // Receipts are collected with a delay of 20 minutes after
 // the corresponding allocation was closed
@@ -66,8 +68,10 @@ export interface AllocationReceiptCollectorOptions {
   metrics: Metrics
   transactionManager: TransactionManager
   allocationExchange: Contract
+  allocations: Eventual<Allocation[]>
   models: QueryFeeModels
   networkSpecification: spec.NetworkSpecification
+  networkSubgraph: NetworkSubgraph
 }
 
 export interface ReceiptCollector {
@@ -81,6 +85,7 @@ export class AllocationReceiptCollector implements ReceiptCollector {
   declare models: QueryFeeModels
   declare transactionManager: TransactionManager
   declare allocationExchange: Contract
+  declare allocations: Eventual<Allocation[]>
   declare collectEndpoint: URL
   declare partialVoucherEndpoint: URL
   declare voucherEndpoint: URL
@@ -89,6 +94,7 @@ export class AllocationReceiptCollector implements ReceiptCollector {
   declare voucherRedemptionBatchThreshold: BigNumber
   declare voucherRedemptionMaxBatchSize: number
   declare protocolNetwork: string
+  declare networkSubgraph: NetworkSubgraph
 
   // eslint-disable-next-line @typescript-eslint/no-empty-function -- Private constructor to prevent direct instantiation
   private constructor() {}
@@ -99,7 +105,9 @@ export class AllocationReceiptCollector implements ReceiptCollector {
     transactionManager,
     models,
     allocationExchange,
+    allocations,
     networkSpecification,
+    networkSubgraph,
   }: AllocationReceiptCollectorOptions): Promise<AllocationReceiptCollector> {
     const collector = new AllocationReceiptCollector()
     collector.logger = logger.child({ component: 'AllocationReceiptCollector' })
@@ -110,7 +118,9 @@ export class AllocationReceiptCollector implements ReceiptCollector {
     collector.transactionManager = transactionManager
     collector.models = models
     collector.allocationExchange = allocationExchange
+    collector.allocations = allocations
     collector.protocolNetwork = networkSpecification.networkIdentifier
+    collector.networkSubgraph = networkSubgraph
 
     // Process Gateway routes
     const gatewayUrls = processGatewayRoutes(networkSpecification.gateway.url)
