@@ -41,7 +41,7 @@
     "@thi.ng/cache": "1.0.94",
     "@urql/core": "2.4.4",
     "apollo-link-http": "1.5.17",
-    "axios": "0.26.1",
+    "axios": "1.7.8",
     "body-parser": "1.20.2",
     "bs58": "5.0.0",
     "cors": "2.8.5",
