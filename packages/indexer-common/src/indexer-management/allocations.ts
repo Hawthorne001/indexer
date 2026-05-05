@@ -50,6 +50,7 @@ import {
   encodeCollectIndexingRewardsData,
   encodePOIMetadata,
 } from '@graphprotocol/toolshed'
+import { assertNotOverAllocated } from './over-allocation'
 
 import {
   BigNumberish,
@@ -2123,6 +2124,13 @@ export class AllocationManager {
         }
       }
     } else {
+      await assertNotOverAllocated(
+        this.network.contracts,
+        params.indexer,
+        logger,
+        params.closingAllocationID,
+      )
+
       // Horizon: Need to multicall collect and stopService
 
       // collect

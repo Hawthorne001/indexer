@@ -16,6 +16,7 @@ import {
 import {
   Allocation,
   AllocationStatus,
+  assertNotOverAllocated,
   CloseAllocationResult,
   CreateAllocationResult,
   encodeCollectData,
@@ -1206,6 +1207,8 @@ async function reallocateHorizonAllocation(
     newAllocationAmount: formatGRT(allocationAmount),
     epoch: currentEpoch.toString(),
   })
+
+  await assertNotOverAllocated(contracts, address, logger, allocation.id)
 
   // Identify how many GRT the indexer has staked
   const freeStake = (await network.networkMonitor.freeStake()).horizon
