@@ -22,6 +22,7 @@ import {
   tapAllocationIdProof,
   parseGraphQLAllocation,
   sequentialTimerMap,
+  chunk,
 } from '..'
 import pReduce from 'p-reduce'
 import { SubgraphClient, QueryResult } from '../subgraph-client'
@@ -35,12 +36,23 @@ const RAV_CHECK_INTERVAL_MS = 900_000
 // 1000 here was leading to http 413 request entity too large
 const PAGE_SIZE = 200
 
+// How many pending RAVs are reconciled per pass. Rows beyond this stay pending and are
+// picked up on later passes once higher value rows settle and leave the set.
+const PENDING_RAV_BATCH_SIZE = 1_000
+
+// How many allocation ids go into a single subgraph request. The id filter travels in
+// every request body, so it is chunked to keep requests the size they had when the
+// batch itself was capped at 100 rows (see the http 413 note above).
+const FILTER_CHUNK_SIZE = 100
+
 interface RavMetrics {
   ravRedeemsSuccess: Counter<string>
   ravRedeemsInvalid: Counter<string>
   ravRedeemsFailed: Counter<string>
   ravsRedeemDuration: Histogram<string>
   ravCollectedFees: Gauge<string>
+  ravsBelowThreshold: Gauge<string>
+  ravsBelowThresholdValueGRT: Gauge<string>
 }
 
 interface TapCollectorOptions {
@@ -162,14 +174,17 @@ export class TapCollector {
 
   startRAVProcessing() {
     const notifyAndMapEligible = (signedRavs: ValidRavs) => {
+      const totalValue = signedRavs.belowThreshold.reduce(
+        (total, signedRav) => total + BigInt(signedRav.rav.rav.valueAggregate),
+        0n,
+      )
+      // Set every pass, including to 0, so the gauges decay once deferrals clear
+      this.metrics.ravsBelowThreshold.set(signedRavs.belowThreshold.length)
+      this.metrics.ravsBelowThresholdValueGRT.set(parseFloat(formatGRT(totalValue)))
+
       if (signedRavs.belowThreshold.length > 0) {
         const logger = this.logger.child({ function: 'startRAVProcessing()' })
-        const totalValueGRT = formatGRT(
-          signedRavs.belowThreshold.reduce(
-            (total, signedRav) => total + BigInt(signedRav.rav.rav.valueAggregate),
-            0n,
-          ),
-        )
+        const totalValueGRT = formatGRT(totalValue)
         logger.info(`[TAPv1] Query RAVs below the redemption threshold`, {
           hint: 'If you would like to redeem RAVs like this, reduce the voucher redemption threshold',
           ravRedemptionThreshold: formatGRT(this.ravRedemptionThreshold),
@@ -377,12 +392,21 @@ export class TapCollector {
   }
 
   // redeem only if last is true
-  // Later can add order and limit
+  // Highest value first, so that RAVs worth collecting are never crowded out of the
+  // batch by dust that sits below the redemption threshold indefinitely.
   private async pendingRAVs(): Promise<ReceiptAggregateVoucher[]> {
-    return await this.models.receiptAggregateVouchers.findAll({
+    const ravs = await this.models.receiptAggregateVouchers.findAll({
       where: { last: true, final: false },
-      limit: 100,
+      order: [['valueAggregate', 'DESC']],
+      limit: PENDING_RAV_BATCH_SIZE,
     })
+    if (ravs.length === PENDING_RAV_BATCH_SIZE) {
+      this.logger.warn(
+        '[TAPv1] Pending RAV batch is full, RAVs below the value cutoff are not reconciled this pass',
+        { batchSize: PENDING_RAV_BATCH_SIZE },
+      )
+    }
+    return ravs
   }
 
   private async filterAndUpdateRavs(
@@ -480,7 +504,6 @@ export class TapCollector {
     ravs: ReceiptAggregateVoucher[],
   ): Promise<TapSubgraphResponse> {
     let meta: TapMeta | undefined = undefined
-    let lastId = ''
     const transactions: TapTransaction[] = []
 
     const unfinalizedRavsAllocationIds = [
@@ -491,79 +514,91 @@ export class TapCollector {
       ...new Set(ravs.map((value) => toAddress(value.senderAddress).toLowerCase())),
     ]
 
-    for (;;) {
-      let block: { hash: string } | undefined = undefined
-      if (meta?.block?.hash) {
-        block = {
-          hash: meta?.block?.hash,
+    // chunk() yields nothing for an empty input, but a query must still run in that
+    // case so the caller gets subgraph block metadata back, hence the explicit [[]].
+    const allocationIdChunks =
+      unfinalizedRavsAllocationIds.length === 0
+        ? [[] as string[]]
+        : chunk(unfinalizedRavsAllocationIds, FILTER_CHUNK_SIZE)
+
+    for (const allocationIdsChunk of allocationIdChunks) {
+      let lastId = ''
+      for (;;) {
+        // After the first response, every request (across pages and chunks) is pinned
+        // to that block, so the whole pass sees one consistent snapshot of the chain.
+        let block: { hash: string } | undefined = undefined
+        if (meta?.block?.hash) {
+          block = {
+            hash: meta?.block?.hash,
+          }
         }
-      }
 
-      this.logger.trace('[TAPv1] Querying Tap Subgraph for RAVs', {
-        lastId,
-        pageSize: PAGE_SIZE,
-        block,
-        unfinalizedRavsAllocationIds,
-        senderAddresses,
-      })
-      const result: QueryResult<TapSubgraphResponse> =
-        await this.tapSubgraph.query<TapSubgraphResponse>(
-          gql`
-            query transactions(
-              $lastId: String!
-              $pageSize: Int!
-              $block: Block_height
-              $unfinalizedRavsAllocationIds: [String!]!
-              $senderAddresses: [String!]!
-            ) {
-              transactions(
-                first: $pageSize
-                block: $block
-                orderBy: id
-                orderDirection: asc
-                where: {
-                  id_gt: $lastId
-                  type: "redeem"
-                  allocationID_in: $unfinalizedRavsAllocationIds
-                  sender_: { id_in: $senderAddresses }
-                }
-              ) {
-                id
-                allocationID
-                timestamp
-                sender {
-                  id
-                }
-              }
-              _meta {
-                block {
-                  hash
-                  timestamp
-                }
-              }
-            }
-          `,
-          {
-            lastId,
-            pageSize: PAGE_SIZE,
-            block,
-            unfinalizedRavsAllocationIds,
-            senderAddresses,
-          },
-        )
-
-      if (!result.data) {
-        this.logger.error('[TAPv1] There was an error while querying Tap Subgraph', {
-          result,
+        this.logger.trace('[TAPv1] Querying Tap Subgraph for RAVs', {
+          lastId,
+          pageSize: PAGE_SIZE,
+          block,
+          allocationIdsChunk,
+          senderAddresses,
         })
-        throw `[TAPv1] There was an error while querying Tap Subgraph. Errors: ${result.error}`
+        const result: QueryResult<TapSubgraphResponse> =
+          await this.tapSubgraph.query<TapSubgraphResponse>(
+            gql`
+              query transactions(
+                $lastId: String!
+                $pageSize: Int!
+                $block: Block_height
+                $unfinalizedRavsAllocationIds: [String!]!
+                $senderAddresses: [String!]!
+              ) {
+                transactions(
+                  first: $pageSize
+                  block: $block
+                  orderBy: id
+                  orderDirection: asc
+                  where: {
+                    id_gt: $lastId
+                    type: "redeem"
+                    allocationID_in: $unfinalizedRavsAllocationIds
+                    sender_: { id_in: $senderAddresses }
+                  }
+                ) {
+                  id
+                  allocationID
+                  timestamp
+                  sender {
+                    id
+                  }
+                }
+                _meta {
+                  block {
+                    hash
+                    timestamp
+                  }
+                }
+              }
+            `,
+            {
+              lastId,
+              pageSize: PAGE_SIZE,
+              block,
+              unfinalizedRavsAllocationIds: allocationIdsChunk,
+              senderAddresses,
+            },
+          )
+
+        if (!result.data) {
+          this.logger.error('[TAPv1] There was an error while querying Tap Subgraph', {
+            result,
+          })
+          throw `[TAPv1] There was an error while querying Tap Subgraph. Errors: ${result.error}`
+        }
+        meta = result.data._meta
+        transactions.push(...result.data.transactions)
+        if (result.data.transactions.length < PAGE_SIZE) {
+          break
+        }
+        lastId = result.data.transactions.slice(-1)[0].id
       }
-      meta = result.data._meta
-      transactions.push(...result.data.transactions)
-      if (result.data.transactions.length < PAGE_SIZE) {
-        break
-      }
-      lastId = result.data.transactions.slice(-1)[0].id
     }
 
     return {
@@ -880,5 +915,17 @@ const registerReceiptMetrics = (metrics: Metrics, networkIdentifier: string) => 
     help: 'Amount of query fees collected for a rav',
     registers: [metrics.registry],
     labelNames: ['allocation'],
+  }),
+
+  ravsBelowThreshold: new metrics.client.Gauge({
+    name: `indexer_agent_ravs_below_threshold_${networkIdentifier}`,
+    help: 'Number of pending ravs deferred because their value is below the redemption threshold',
+    registers: [metrics.registry],
+  }),
+
+  ravsBelowThresholdValueGRT: new metrics.client.Gauge({
+    name: `indexer_agent_ravs_below_threshold_value_grt_${networkIdentifier}`,
+    help: 'Total GRT value of pending ravs deferred below the redemption threshold',
+    registers: [metrics.registry],
   }),
 })
