@@ -33,7 +33,7 @@
     "@types/sequelize": "4.28.20",
     "@urql/core": "3.1.0",
     "@urql/exchange-execute": "2.1.0",
-    "axios": "1.6.2",
+    "axios": "1.12.0",
     "body-parser": "1.20.2",
     "cors": "2.8.5",
     "ethers": "6.13.7",
